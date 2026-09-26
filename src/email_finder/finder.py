@@ -29,12 +29,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from email_finder.api_verifier import ApiResult, BaseApiVerifier, get_verifier
+from email_finder.api_verifier import ApiResult, ApiStatus, BaseApiVerifier, get_verifier
+from email_finder.cache import BaseCache
 from email_finder.combiner import combine
 from email_finder.domain import resolve_domain
 from email_finder.name_parser import ParsedName, parse_name
 from email_finder.permutations import generate_permutations
-from email_finder.smtp_verifier import SmtpResult, verify_smtp
+from email_finder.rate_limiter import RateLimiter
+from email_finder.smtp_verifier import SmtpResult, SmtpStatus, verify_smtp
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +81,19 @@ class FinderConfig:
 
     api_timeout: float = 15.0
     """HTTP timeout for API calls in seconds."""
+
+    # ── Caching ───────────────────────────────────────────────────────────────
+    cache: BaseCache | None = None
+    """Cache backend to use.  ``None`` disables caching.
+
+    Pass an :class:`~email_finder.cache.InMemoryCache` to avoid re-checking
+    the same address within a single session, or a
+    :class:`~email_finder.cache.SqliteCache` to persist results across runs.
+    """
+
+    cache_ttl: float = 3600.0
+    """How long (seconds) to keep cached verification results.
+    Defaults to 1 hour.  ``0`` = never expire."""
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +164,56 @@ class FinderResult:
 
 
 # ---------------------------------------------------------------------------
+# Cache serialisation helpers
+# ---------------------------------------------------------------------------
+
+def _smtp_to_dict(r: SmtpResult) -> dict[str, Any]:
+    return {
+        "email":     r.email,
+        "status":    r.status.value,
+        "smtp_code": r.smtp_code,
+        "mx_host":   r.mx_host,
+        "detail":    r.detail,
+        "attempts":  r.attempts,
+    }
+
+
+def _smtp_from_dict(d: dict[str, Any]) -> SmtpResult:
+    return SmtpResult(
+        email=d["email"],
+        status=SmtpStatus(d["status"]),
+        smtp_code=d.get("smtp_code"),
+        mx_host=d.get("mx_host"),
+        detail=d.get("detail", ""),
+        attempts=d.get("attempts", 0),
+    )
+
+
+def _api_to_dict(r: ApiResult) -> dict[str, Any]:
+    return {
+        "email":      r.email,
+        "status":     r.status.value,
+        "provider":   r.provider,
+        "score":      r.score,
+        "raw_status": r.raw_status,
+        "detail":     r.detail,
+        "extra":      r.extra,
+    }
+
+
+def _api_from_dict(d: dict[str, Any]) -> ApiResult:
+    return ApiResult(
+        email=d["email"],
+        status=ApiStatus(d["status"]),
+        provider=d.get("provider", ""),
+        score=d.get("score"),
+        raw_status=d.get("raw_status", ""),
+        detail=d.get("detail", ""),
+        extra=d.get("extra", {}),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main API
 # ---------------------------------------------------------------------------
 
@@ -202,7 +267,7 @@ def find_emails(
     # ── 3. Permutation generation ─────────────────────────────────────────────
     permutations = generate_permutations(parsed, domain_result.domain)
 
-    # ── 4. Verifier setup ─────────────────────────────────────────────────────
+    # ── 4. Verifier + cache + rate-limiter setup ──────────────────────────────
     api_verifier: BaseApiVerifier | None = None
     if config.run_api:
         api_verifier = get_verifier(config.api_provider, api_key=config.api_key)
@@ -215,26 +280,50 @@ def find_emails(
 
     run_verification = config.run_smtp or bool(api_verifier)
 
+    cache = config.cache
+    # One rate-limiter is shared across both SMTP and API calls so that the
+    # inter-probe delay is counted from the *previous* call, not added on top.
+    rate_limiter = RateLimiter(min_interval=config.smtp_delay if run_verification else 0.0)
+
     # ── 5. Per-candidate verification ─────────────────────────────────────────
     email_results: list[EmailResult] = []
 
     for idx, candidate in enumerate(permutations):
-        if run_verification and idx > 0:
-            time.sleep(config.smtp_delay)
-
         smtp_result: SmtpResult | None = None
         api_result:  ApiResult  | None = None
 
+        # ── SMTP (cache-aware) ────────────────────────────────────────────────
         if config.run_smtp:
-            smtp_result = verify_smtp(
-                candidate.address,
-                from_address=config.smtp_from_address,
-                timeout=config.smtp_timeout,
-                max_retries=config.smtp_max_retries,
-            )
+            smtp_key    = f"smtp:{candidate.address}"
+            cached_smtp = cache.get(smtp_key) if cache else None
 
+            if cached_smtp is not None:
+                smtp_result = _smtp_from_dict(cached_smtp)
+            else:
+                if idx > 0:
+                    rate_limiter.acquire()   # polite delay only on cache miss
+                smtp_result = verify_smtp(
+                    candidate.address,
+                    from_address=config.smtp_from_address,
+                    timeout=config.smtp_timeout,
+                    max_retries=config.smtp_max_retries,
+                )
+                if cache:
+                    cache.set(smtp_key, _smtp_to_dict(smtp_result), ttl=config.cache_ttl)
+
+        # ── API (cache-aware) ─────────────────────────────────────────────────
         if api_verifier:
-            api_result = api_verifier.verify(candidate.address)
+            api_key_str = f"api:{api_verifier.provider_name}:{candidate.address}"
+            cached_api  = cache.get(api_key_str) if cache else None
+
+            if cached_api is not None:
+                api_result = _api_from_dict(cached_api)
+            else:
+                if not config.run_smtp and idx > 0:
+                    rate_limiter.acquire()   # rate-limit API-only mode too
+                api_result = api_verifier.verify(candidate.address)
+                if cache:
+                    cache.set(api_key_str, _api_to_dict(api_result), ttl=config.cache_ttl)
 
         confidence = 0
         verdict    = "unverified"

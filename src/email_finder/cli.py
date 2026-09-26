@@ -18,6 +18,7 @@ import click
 
 from email_finder import __version__
 from email_finder.api_verifier import ApiStatus
+from email_finder.cache import make_cache
 from email_finder.config import get as cfg_get
 from email_finder.config import load_config
 from email_finder.finder import FinderConfig, FinderResult, find_emails, result_to_json
@@ -143,6 +144,13 @@ def _render(result: FinderResult, verify_any: bool) -> None:
               help="Verify via third-party API (requires API key in .env).")
 @click.option("--api-provider", default="hunter", show_default=True, metavar="PROVIDER",
               help="API provider: 'hunter' (Hunter.io) or 'mock' (testing).")
+# ── Cache ─────────────────────────────────────────────────────────────────────
+@click.option("--cache", "use_cache", is_flag=True, default=False,
+              help="Cache verification results in memory for this run.")
+@click.option("--cache-db", default=None, metavar="FILE",
+              help="Persist cache to a SQLite file (survives across runs).")
+@click.option("--cache-ttl", default=3600.0, show_default=True, metavar="SECS",
+              help="Cache entry time-to-live in seconds.")
 # ── Output ────────────────────────────────────────────────────────────────────
 @click.option("--json", "as_json", is_flag=True, default=False,
               help="Print results as JSON instead of the human-readable table.")
@@ -158,6 +166,9 @@ def main(
     smtp_retries: int,
     run_api:      bool,
     api_provider: str,
+    use_cache:    bool,
+    cache_db:     str | None,
+    cache_ttl:    float,
     as_json:      bool,
     output:       str | None,
 ) -> None:
@@ -167,6 +178,13 @@ def main(
 
     if not company and not domain:
         raise click.UsageError("Provide at least one of --company or --domain.")
+
+    # ── Cache setup ───────────────────────────────────────────────────────────
+    cache = None
+    if cache_db:
+        cache = make_cache("sqlite", db_path=cache_db, default_ttl=cache_ttl)
+    elif use_cache:
+        cache = make_cache("memory", default_ttl=cache_ttl)
 
     # API key — read from environment for real providers
     api_key = ""
@@ -182,6 +200,8 @@ def main(
         api_provider=api_provider,
         api_key=api_key,
         api_timeout=15.0,
+        cache=cache,
+        cache_ttl=cache_ttl,
     )
 
     try:
