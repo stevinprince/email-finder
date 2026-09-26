@@ -9,6 +9,7 @@ dependencies = [
     "dnspython>=2.8.0",
     "nameparser>=2.3.0",
     "python-dotenv>=1.0",
+    "requests>=2.34.2",
 ]
 
 [project.scripts]

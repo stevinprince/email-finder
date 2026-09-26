@@ -13,6 +13,9 @@ from __future__ import annotations
 import click
 
 from email_finder import __version__
+from email_finder.api_verifier import ApiStatus, get_verifier
+from email_finder.combiner import combine
+from email_finder.config import get as cfg_get
 from email_finder.config import load_config
 from email_finder.domain import resolve_domain
 from email_finder.name_parser import parse_name
@@ -64,6 +67,20 @@ from email_finder.smtp_verifier import SmtpStatus, verify_smtp
     metavar="SECONDS",
     help="Delay between consecutive SMTP probes (be polite to mail servers).",
 )
+@click.option(
+    "--api",
+    "run_api",
+    is_flag=True,
+    default=False,
+    help="Run third-party API verification on each candidate (requires API key in .env).",
+)
+@click.option(
+    "--api-provider",
+    default="hunter",
+    show_default=True,
+    metavar="PROVIDER",
+    help="API provider to use: 'hunter' (Hunter.io) or 'mock' (testing).",
+)
 def main(
     name: str,
     company: str | None,
@@ -71,6 +88,8 @@ def main(
     run_smtp: bool,
     smtp_timeout: float,
     smtp_delay: float,
+    run_api: bool,
+    api_provider: str,
 ) -> None:
     """Find and verify professional email addresses for a person at a company."""
 
@@ -118,41 +137,77 @@ def main(
         for note in domain_result.notes:
             click.echo(f"  ⚠  {note}")
 
-    # ── Permutation table ─────────────────────────────────────────────────────
-    smtp_col = "  Status       Code  MX host" if run_smtp else ""
-    click.echo()
-    click.echo(f"  {'#':<4} {'Pattern':<20} {'Email address':<40}{smtp_col}")
-    click.echo(f"  {'-'*4} {'-'*20} {'-'*40}" + ("  " + "-"*52 if run_smtp else ""))
+    # ── Optional API verifier setup ───────────────────────────────────────────
+    api_verifier = None
+    if run_api:
+        api_key = cfg_get("HUNTER_API_KEY", "") if api_provider == "hunter" else ""
+        try:
+            api_verifier = get_verifier(api_provider, api_key=api_key or "")
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
 
-    # ── Optional SMTP verification ────────────────────────────────────────────
-    _STATUS_COLOUR = {
+    # ── Permutation table ─────────────────────────────────────────────────────
+    verify_any = run_smtp or run_api
+    extra_col  = "  Confidence  Verdict     SMTP         API" if verify_any else ""
+    click.echo()
+    click.echo(f"  {'#':<4} {'Pattern':<20} {'Email address':<40}{extra_col}")
+    click.echo(f"  {'-'*4} {'-'*20} {'-'*40}" + ("  " + "-"*50 if verify_any else ""))
+
+    _SMTP_LABEL: dict[SmtpStatus, tuple[str, str]] = {
         SmtpStatus.VALID:     ("green",  "✓ valid    "),
         SmtpStatus.INVALID:   ("red",    "✗ invalid  "),
         SmtpStatus.CATCH_ALL: ("yellow", "~ catch-all"),
         SmtpStatus.UNKNOWN:   ("yellow", "? unknown  "),
         SmtpStatus.ERROR:     ("red",    "! error    "),
     }
+    _API_LABEL: dict[ApiStatus, tuple[str, str]] = {
+        ApiStatus.VALID:   ("green",  "✓ valid  "),
+        ApiStatus.INVALID: ("red",    "✗ invalid"),
+        ApiStatus.UNKNOWN: ("yellow", "? unknown"),
+        ApiStatus.ERROR:   ("red",    "! error  "),
+    }
+    _VERDICT_COLOUR = {"valid": "green", "uncertain": "yellow", "invalid": "red"}
 
     import time as _time
 
     for i, candidate in enumerate(candidates):
-        smtp_suffix = ""
+        if verify_any and i > 0:
+            _time.sleep(smtp_delay)
+
+        smtp_result = None
+        api_result  = None
+
         if run_smtp:
-            if i > 0:
-                _time.sleep(smtp_delay)
-            click.echo(f"  Checking {candidate.address} …", nl=False)
-            result = verify_smtp(candidate.address, timeout=smtp_timeout)
-            colour, label = _STATUS_COLOUR[result.status]
-            code_str = str(result.smtp_code) if result.smtp_code else "—"
-            mx_str   = result.mx_host or "—"
-            smtp_suffix = f"  {click.style(label, fg=colour)}  {code_str:<5} {mx_str}"
-            # overwrite the "Checking …" line
-            click.echo(f"\r  {candidate.rank:<4} {candidate.pattern:<20} {candidate.address:<40}{smtp_suffix}")
+            smtp_result = verify_smtp(candidate.address, timeout=smtp_timeout)
+        if run_api and api_verifier:
+            api_result = api_verifier.verify(candidate.address)
+
+        if verify_any:
+            combined = combine(candidate.address, smtp=smtp_result, api=api_result)
+
+            conf_str    = f"{combined.confidence:>3}/100"
+            v_colour    = _VERDICT_COLOUR.get(combined.verdict, "white")
+            verdict_str = click.style(f"{combined.verdict:<11}", fg=v_colour)
+
+            if smtp_result:
+                sc, sl = _SMTP_LABEL[smtp_result.status]
+                smtp_str = click.style(sl, fg=sc)
+            else:
+                smtp_str = "—           "
+
+            if api_result:
+                ac, al = _API_LABEL[api_result.status]
+                api_str = click.style(al, fg=ac)
+            else:
+                api_str = "—"
+
+            suffix = f"  {conf_str}  {verdict_str}  {smtp_str}  {api_str}"
+            click.echo(f"  {candidate.rank:<4} {candidate.pattern:<20} {candidate.address:<40}{suffix}")
         else:
             click.echo(f"  {candidate.rank:<4} {candidate.pattern:<20} {candidate.address}")
 
-    if not run_smtp:
+    if not verify_any:
         click.echo()
-        click.echo("  Tip: add --smtp to run SMTP verification on each address.")
+        click.echo("  Tip: add --smtp and/or --api to verify each address.")
     click.echo()
-    click.echo("[Steps 5–8 not yet implemented]")
+    click.echo("[Steps 6–8 not yet implemented]")
