@@ -17,6 +17,7 @@ from email_finder.config import load_config
 from email_finder.domain import resolve_domain
 from email_finder.name_parser import parse_name
 from email_finder.permutations import generate_permutations
+from email_finder.smtp_verifier import SmtpStatus, verify_smtp
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
@@ -42,7 +43,35 @@ from email_finder.permutations import generate_permutations
     metavar="DOMAIN",
     help="Corporate domain, e.g. 'acme.com'. Skips domain resolution when provided.",
 )
-def main(name: str, company: str | None, domain: str | None) -> None:
+@click.option(
+    "--smtp",
+    "run_smtp",
+    is_flag=True,
+    default=False,
+    help="Run SMTP verification on each candidate address (slow; may trigger rate limits).",
+)
+@click.option(
+    "--smtp-timeout",
+    default=10.0,
+    show_default=True,
+    metavar="SECONDS",
+    help="Per-connection timeout for SMTP probes.",
+)
+@click.option(
+    "--smtp-delay",
+    default=1.0,
+    show_default=True,
+    metavar="SECONDS",
+    help="Delay between consecutive SMTP probes (be polite to mail servers).",
+)
+def main(
+    name: str,
+    company: str | None,
+    domain: str | None,
+    run_smtp: bool,
+    smtp_timeout: float,
+    smtp_delay: float,
+) -> None:
     """Find and verify professional email addresses for a person at a company."""
 
     # Load .env (no-op if the file does not exist yet)
@@ -89,13 +118,41 @@ def main(name: str, company: str | None, domain: str | None) -> None:
         for note in domain_result.notes:
             click.echo(f"  ⚠  {note}")
 
+    # ── Permutation table ─────────────────────────────────────────────────────
+    smtp_col = "  Status       Code  MX host" if run_smtp else ""
     click.echo()
-    click.echo(f"  {'#':<4} {'Pattern':<20} {'Email address'}")
-    click.echo(f"  {'-'*4} {'-'*20} {'-'*40}")
-    for candidate in candidates:
-        click.echo(
-            f"  {candidate.rank:<4} {candidate.pattern:<20} {candidate.address}"
-        )
+    click.echo(f"  {'#':<4} {'Pattern':<20} {'Email address':<40}{smtp_col}")
+    click.echo(f"  {'-'*4} {'-'*20} {'-'*40}" + ("  " + "-"*52 if run_smtp else ""))
 
+    # ── Optional SMTP verification ────────────────────────────────────────────
+    _STATUS_COLOUR = {
+        SmtpStatus.VALID:     ("green",  "✓ valid    "),
+        SmtpStatus.INVALID:   ("red",    "✗ invalid  "),
+        SmtpStatus.CATCH_ALL: ("yellow", "~ catch-all"),
+        SmtpStatus.UNKNOWN:   ("yellow", "? unknown  "),
+        SmtpStatus.ERROR:     ("red",    "! error    "),
+    }
+
+    import time as _time
+
+    for i, candidate in enumerate(candidates):
+        smtp_suffix = ""
+        if run_smtp:
+            if i > 0:
+                _time.sleep(smtp_delay)
+            click.echo(f"  Checking {candidate.address} …", nl=False)
+            result = verify_smtp(candidate.address, timeout=smtp_timeout)
+            colour, label = _STATUS_COLOUR[result.status]
+            code_str = str(result.smtp_code) if result.smtp_code else "—"
+            mx_str   = result.mx_host or "—"
+            smtp_suffix = f"  {click.style(label, fg=colour)}  {code_str:<5} {mx_str}"
+            # overwrite the "Checking …" line
+            click.echo(f"\r  {candidate.rank:<4} {candidate.pattern:<20} {candidate.address:<40}{smtp_suffix}")
+        else:
+            click.echo(f"  {candidate.rank:<4} {candidate.pattern:<20} {candidate.address}")
+
+    if not run_smtp:
+        click.echo()
+        click.echo("  Tip: add --smtp to run SMTP verification on each address.")
     click.echo()
-    click.echo("[Steps 4–8 (verification) not yet implemented]")
+    click.echo("[Steps 5–8 not yet implemented]")
