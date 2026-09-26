@@ -14,6 +14,7 @@ import click
 
 from email_finder import __version__
 from email_finder.config import load_config
+from email_finder.domain import resolve_domain
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
@@ -51,12 +52,21 @@ def main(name: str, company: str | None, domain: str | None) -> None:
             "Provide at least one of --company or --domain."
         )
 
-    # ── Placeholder output (business logic added in later steps) ──────────────
+    # ── Domain resolution (Step 2) ────────────────────────────────────────────
+    result = resolve_domain(company=company, domain=domain)
+
+    # ── Output ────────────────────────────────────────────────────────────────
     click.echo(f"email-finder v{__version__}")
-    click.echo(f"  Name    : {name}")
+    click.echo(f"  Name       : {name}")
     if company:
-        click.echo(f"  Company : {company}")
-    if domain:
-        click.echo(f"  Domain  : {domain}")
+        click.echo(f"  Company    : {company}")
+    click.echo(f"  Domain     : {result.domain}")
+    click.echo(f"  Resolved by: {result.method}  (confidence: {result.confidence})")
+
+    if result.notes:
+        click.echo()
+        for note in result.notes:
+            click.echo(f"  ⚠  {note}")
+
     click.echo()
-    click.echo("[Step 1 scaffold — business logic not yet implemented]")
+    click.echo("[Steps 3–8 not yet implemented]")
