@@ -32,6 +32,7 @@ Public API
 
 from __future__ import annotations
 
+import logging
 import random
 import smtplib
 import socket
@@ -42,6 +43,8 @@ from enum import Enum
 
 import dns.exception
 import dns.resolver
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -106,14 +109,18 @@ def lookup_mx(domain: str, *, timeout: float = 10.0) -> list[str]:
     resolver = dns.resolver.Resolver()
     resolver.lifetime = timeout
 
+    _log.debug("DNS MX query for %r", domain)
     try:
         answers = resolver.resolve(domain, "MX")
     except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        _log.debug("No MX records found for %r", domain)
         return []
     # Let other dns.exception.DNSException subclasses propagate to the caller.
 
     records = sorted(answers, key=lambda r: r.preference)
-    return [str(r.exchange).rstrip(".") for r in records]
+    hosts = [str(r.exchange).rstrip(".") for r in records]
+    _log.debug("MX records for %s: %s", domain, ", ".join(hosts))
+    return hosts
 
 
 # ---------------------------------------------------------------------------
@@ -139,12 +146,16 @@ def _probe(
         ConnectionRefusedError: Port 25 is blocked / not listening.
         OSError: Other network-level errors.
     """
+    _log.debug("Connecting to %s:%d", mx_host, _SMTP_PORT)
     with smtplib.SMTP(mx_host, _SMTP_PORT, timeout=timeout) as smtp:
         # ── EHLO (fall back to HELO for legacy servers) ───────────────────
         code, _ = smtp.ehlo()
+        _log.debug("EHLO → %d", code)
         if code >= 400:
             code, _ = smtp.helo()
+            _log.debug("HELO → %d", code)
             if code >= 400:
+                _log.debug("Both EHLO and HELO rejected (%d)", code)
                 return SmtpResult(
                     email=email,
                     status=SmtpStatus.UNKNOWN,
@@ -155,6 +166,7 @@ def _probe(
 
         # ── MAIL FROM ─────────────────────────────────────────────────────
         code, _ = smtp.mail(from_address)
+        _log.debug("MAIL FROM <%s> → %d", from_address, code)
         if code >= 400:
             return SmtpResult(
                 email=email,
@@ -172,9 +184,11 @@ def _probe(
         )
         probe_addr = f"{random_local}@{domain}"
         catch_code, _ = smtp.rcpt(probe_addr)
+        _log.debug("Catch-all probe RCPT TO <%s> → %d", probe_addr, catch_code)
         smtp.rset()  # reset transaction before the real RCPT TO
 
         if catch_code == 250:
+            _log.debug("Domain %s is catch-all", domain)
             return SmtpResult(
                 email=email,
                 status=SmtpStatus.CATCH_ALL,
@@ -190,6 +204,7 @@ def _probe(
         # ── Real RCPT TO ──────────────────────────────────────────────────
         smtp.mail(from_address)   # restart transaction after rset
         code, msg = smtp.rcpt(email)
+        _log.debug("RCPT TO <%s> → %d", email, code)
         return _interpret_rcpt_code(email, mx_host, code, msg)
 
 
@@ -305,6 +320,7 @@ def verify_smtp(
     try:
         mx_hosts = lookup_mx(domain, timeout=dns_timeout)
     except dns.exception.DNSException as exc:
+        _log.debug("DNS error for %s: %s", domain, exc)
         return SmtpResult(
             email=email,
             status=SmtpStatus.ERROR,
@@ -312,6 +328,7 @@ def verify_smtp(
         )
 
     if not mx_hosts:
+        _log.debug("No MX records for %s — skipping SMTP", domain)
         return SmtpResult(
             email=email,
             status=SmtpStatus.ERROR,
@@ -327,7 +344,9 @@ def verify_smtp(
     for mx_host in mx_hosts:
         for attempt in range(max_retries + 1):
             if attempt > 0:
-                time.sleep(retry_delay * (2 ** (attempt - 1)))
+                delay = retry_delay * (2 ** (attempt - 1))
+                _log.debug("Retry %d/%d for %s (waiting %.1fs)", attempt, max_retries, email, delay)
+                time.sleep(delay)
 
             try:
                 result = _probe(email, domain, mx_host, from_address, timeout)

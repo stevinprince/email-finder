@@ -24,6 +24,7 @@ Typical usage (Python API)
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,8 @@ from email_finder.name_parser import ParsedName, parse_name
 from email_finder.permutations import generate_permutations
 from email_finder.rate_limiter import RateLimiter
 from email_finder.smtp_verifier import SmtpResult, SmtpStatus, verify_smtp
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -287,10 +290,14 @@ def find_emails(
 
     # ── 5. Per-candidate verification ─────────────────────────────────────────
     email_results: list[EmailResult] = []
+    total = len(permutations)
 
     for idx, candidate in enumerate(permutations):
         smtp_result: SmtpResult | None = None
         api_result:  ApiResult  | None = None
+
+        if run_verification:
+            _log.info("[%d/%d] %s", idx + 1, total, candidate.address)
 
         # ── SMTP (cache-aware) ────────────────────────────────────────────────
         if config.run_smtp:
@@ -299,15 +306,21 @@ def find_emails(
 
             if cached_smtp is not None:
                 smtp_result = _smtp_from_dict(cached_smtp)
+                _log.info("  smtp → %s  (cached)", smtp_result.status.value)
             else:
                 if idx > 0:
                     rate_limiter.acquire()   # polite delay only on cache miss
+                _log.debug("  smtp: probing %s via %s ...", candidate.address,
+                            candidate.address.split("@")[1])
                 smtp_result = verify_smtp(
                     candidate.address,
                     from_address=config.smtp_from_address,
                     timeout=config.smtp_timeout,
                     max_retries=config.smtp_max_retries,
                 )
+                _log.info("  smtp → %s  (mx: %s)",
+                           smtp_result.status.value,
+                           smtp_result.mx_host or "n/a")
                 if cache:
                     cache.set(smtp_key, _smtp_to_dict(smtp_result), ttl=config.cache_ttl)
 
@@ -318,10 +331,17 @@ def find_emails(
 
             if cached_api is not None:
                 api_result = _api_from_dict(cached_api)
+                _log.info("  api(%s) → %s  (cached)", api_verifier.provider_name,
+                           api_result.status.value)
             else:
                 if not config.run_smtp and idx > 0:
                     rate_limiter.acquire()   # rate-limit API-only mode too
+                _log.debug("  api: calling %s for %s ...",
+                            api_verifier.provider_name, candidate.address)
                 api_result = api_verifier.verify(candidate.address)
+                _log.info("  api(%s) → %s  (score: %s)",
+                           api_verifier.provider_name, api_result.status.value,
+                           api_result.score if api_result.score is not None else "n/a")
                 if cache:
                     cache.set(api_key_str, _api_to_dict(api_result), ttl=config.cache_ttl)
 
@@ -331,6 +351,7 @@ def find_emails(
             combined   = combine(candidate.address, smtp=smtp_result, api=api_result)
             confidence = combined.confidence
             verdict    = combined.verdict
+            _log.info("  → %s  (confidence: %d/100)", verdict, confidence)
 
         email_results.append(
             EmailResult(

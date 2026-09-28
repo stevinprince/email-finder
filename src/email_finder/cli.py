@@ -12,6 +12,8 @@ Usage examples
 
 from __future__ import annotations
 
+import logging
+import sys
 from pathlib import Path
 
 import click
@@ -156,6 +158,12 @@ def _render(result: FinderResult, verify_any: bool) -> None:
               help="Print results as JSON instead of the human-readable table.")
 @click.option("--output", "-o", default=None, metavar="FILE",
               help="Write JSON results to FILE (implies --json format).")
+@click.option("-v", "--verbose", count=True,
+              help=(
+                  "Increase verbosity. "
+                  "-v shows per-candidate progress; "
+                  "-vv adds SMTP/API debug details."
+              ))
 def main(
     name:         str,
     company:      str | None,
@@ -171,8 +179,28 @@ def main(
     cache_ttl:    float,
     as_json:      bool,
     output:       str | None,
+    verbose:      int,
 ) -> None:
     """Find and verify professional email addresses for a person at a company."""
+
+    # ── Logging configuration ─────────────────────────────────────────────────
+    # -v  → INFO  (per-candidate progress)
+    # -vv → DEBUG (MX records, SMTP codes, raw API responses)
+    # default → WARNING (silent)
+    if verbose >= 2:
+        log_level  = logging.DEBUG
+        log_format = "[%(module)s] %(message)s"   # -vv: show which module
+    elif verbose == 1:
+        log_level  = logging.INFO
+        log_format = "%(message)s"                # -v:  clean per-candidate lines
+    else:
+        log_level  = logging.WARNING
+        log_format = "%(message)s"
+
+    logging.basicConfig(stream=sys.stderr, level=log_level, format=log_format)
+    # Quieten noisy third-party libraries even in debug mode
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
 
     load_config()
 

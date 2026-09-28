@@ -26,6 +26,7 @@ Adding a new provider
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -33,6 +34,8 @@ from enum import Enum
 from typing import Any
 
 import requests
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +146,7 @@ class HunterVerifier(BaseApiVerifier):
 
     def verify(self, email: str) -> ApiResult:
         """Call Hunter.io's email-verifier endpoint and return a normalised result."""
+        _log.debug("GET %s?email=%s", self._BASE_URL, email)
         try:
             resp = self._session.get(
                 self._BASE_URL,
@@ -219,6 +223,10 @@ class HunterVerifier(BaseApiVerifier):
         result_str = data.get("result", "")     # "deliverable" / "undeliverable" / …
 
         status = self._STATUS_MAP.get(raw_status, ApiStatus.UNKNOWN)
+        _log.debug(
+            "Hunter.io response for %s: raw_status=%r score=%s result=%r → %s",
+            email, raw_status, score, result_str, status.value,
+        )
 
         detail_parts = [f"status={raw_status!r}"]
         if result_str:
